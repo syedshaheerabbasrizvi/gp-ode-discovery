@@ -1,0 +1,15 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Logs and generated images
+gp_run.log
+# Note: You can remove gp_stats.png from here if you want it on your GitHub README!
+gp_stats.png
