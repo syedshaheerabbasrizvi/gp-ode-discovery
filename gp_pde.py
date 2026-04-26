@@ -27,19 +27,7 @@ logging.basicConfig(
 # SECTION 1: DATA GENERATOR
 # ─────────────────────────────────────────────
 
-# dN/dt = r*N*(1 - N/K)
-# Ground truth structure: N - N^2 (with fitted r, r/K)
-# ── SECTION 1: DATA GENERATOR (Allee Effect) ──
-# ── SECTION 1: DATA GENERATOR (Quadratic Decay) ──
-# ── SECTION 1: DATA GENERATOR (Pitchfork Bifurcation) ──
-def data_gen_pitchfork(r=0.5, x0=0.1, noise=0.05, t=None):
-    def ode(x, t):
-        return r * x - x**3
-    clean = odeint(ode, x0, t).flatten()
-    
-    scale = noise * np.mean(clean)
-    noisy_x = clean + np.random.normal(scale=scale, size=clean.shape)
-    return t, noisy_x
+from python_benchmark import get_cstr_experiments
 
 # ─────────────────────────────────────────────
 # SECTION 2: PARAMETER INCLUSION (Algorithm 2)
@@ -189,12 +177,13 @@ def fitness(individual, experiments, gp_config, n_start=0):
 # SECTION 4: DEAP SETUP
 # ─────────────────────────────────────────────
 
-pset = gp.PrimitiveSet("dx_dt", arity=0)
+pset = gp.PrimitiveSet("dcA_dt", arity=0)
 pset.addPrimitive(operator.add, 2, name="+")
 pset.addPrimitive(operator.sub, 2, name="-")
 pset.addPrimitive(operator.mul, 2, name="*")
-pset.addTerminal("x", name="x") # <--- Changed N to x
-
+pset.addTerminal("c_A",   name="c_A")
+pset.addTerminal("c_Af",  name="c_Af")
+pset.addTerminal("c_A^2", name="c_A^2")
 creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
 creator.create("Individual", gp.PrimitiveTree, fitness=creator.FitnessMin)
 
@@ -216,18 +205,10 @@ toolbox.decorate("mutate", gp.staticLimit(key=operator.attrgetter("height"), max
 # ── SECTION 5: WIRING FITNESS INTO DEAP ──
 bin_prim_funcs   = {"+": operator.add, "-": operator.sub, "*": operator.mul}
 unary_prim_funcs = {}
-arg_set = {"x"} # <--- Changed N to x
-gp_config = {"unary_prim": unary_prim_funcs, "bin_prim": bin_prim_funcs, "arg_set": arg_set}
+arg_set          = {"c_A", "c_Af", "c_A^2"}
+gp_config        = {"unary_prim": unary_prim_funcs, "bin_prim": bin_prim_funcs, "arg_set": arg_set}
 
-t = np.linspace(0, 10, 100)
-t1, x1 = data_gen_pitchfork(r=0.5, x0=0.1, noise=0.05, t=t)
-t2, x2 = data_gen_pitchfork(r=0.8, x0=0.2, noise=0.05, t=t)
-
-experiments = [
-    # Mapped the ODE state to the GP's new "x" variable!
-    (t1, x1, {"x": lambda state: state}), 
-    (t2, x2, {"x": lambda state: state}),
-]
+experiments = get_cstr_experiments(noise=0.05, seed=0)
 
 def evaluate_individual(ind):
     return fitness([node.name for node in ind], experiments, gp_config)
@@ -342,7 +323,7 @@ if __name__ == "__main__":
 
     # ── Parameter fits ──
     logging.info("\n── Hall of Fame Parameter Fits ──")
-    logging.info("Ground truth: dN/dt = r*N - (r/K)*N^2  (r=0.5, K=100 / r=0.3, K=150)\n")
+    logging.info("Ground truth: dcA/dt = 0.5*(cAf - cA) - cA^2")
 
     for rank, ind in enumerate(hof):
         try:
@@ -379,7 +360,7 @@ if __name__ == "__main__":
             t_all  = np.concatenate([exp[0] for exp in experiments])
             N_all  = np.concatenate([exp[1] for exp in experiments])
             dummy_X = t_all
-            p0 = [1e-4] * n_params
+            p0 = [0.5] * n_params
             lower_bounds = [-100.0] * n_params
             upper_bounds = [100.0] * n_params
 
