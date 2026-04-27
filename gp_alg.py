@@ -214,20 +214,6 @@ toolbox.register("evaluate", evaluate_individual)
 
 # ─────────────────────────────────────────────
 # SECTION 5: SEMANTIC SIMILARITY-BASED CROSSOVER (SSC)
-#
-# From: Nguyen Quang Uy et al., "Semantically-based Crossover in GP"
-#
-# THE BUG THAT WAS FIXED:
-#   Previous code did:  ind1[:] = ind1[:idx1] + ind2[slice2] + ind1[slice1.stop:]
-#   When slice1.stop == len(ind1), Python creates slice(stop, None) for the suffix,
-#   and DEAP's PrimitiveTree.__setitem__ does:  if key.start >= len(self)
-#   which crashes with TypeError when key.start is None.
-#
-# THE FIX:
-#   Use explicit integer indices (start, stop) extracted from the slice object,
-#   build new node lists as plain Python lists, then assign all at once.
-#   We never pass a slice object to __setitem__ — only a complete list.
-# ─────────────────────────────────────────────
 
 SSC_ALPHA     = 1e-4   # lower SSD bound: subtrees must differ by at least this
 SSC_BETA      = 0.4    # upper SSD bound: subtrees must not differ by more than this
