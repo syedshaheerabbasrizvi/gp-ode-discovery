@@ -8,18 +8,27 @@ from scipy.optimize import curve_fit, OptimizeWarning
 from deap import base, creator, tools, gp, algorithms
 from tqdm import tqdm
 from multiprocessing import Pool
-import warnings
+import copy
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-logging.basicConfig(
-    filename="gp_feynman_I6_2a.log",
-    filemode="w",
-    format="%(message)s",
-    level=logging.INFO
-)
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+
+def get_logger(name, filepath):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    fh = logging.FileHandler(filepath, mode="w")
+    fh.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(fh)
+    return logger
+
+logger_sc  = get_logger("sc",  "gp_standard_crossover.log")
+logger_ssc = get_logger("ssc", "gp_semantic_crossover.log")
+
 
 # ─────────────────────────────────────────────
-# SECTION 1: PARAM INCLUSION (unchanged from original)
+# SECTION 1: PARAM INCLUSION (unchanged)
 # ─────────────────────────────────────────────
 
 def param_incl(exp_tree, unary_prim, bin_prim, arg_set, n_start):
@@ -70,8 +79,7 @@ def param_incl(exp_tree, unary_prim, bin_prim, arg_set, n_start):
 
 
 # ─────────────────────────────────────────────
-# SECTION 2: FITNESS — DIRECT FUNCTION REGRESSION
-# (No ODE; just evaluate f(vars, thetas) per data row)
+# SECTION 2: FITNESS (unchanged)
 # ─────────────────────────────────────────────
 
 def safe_exp(x):
@@ -95,7 +103,7 @@ def fitness(individual, data_arrays, y_measured, gp_config, n_start=0):
 
         def model(dummy_X, *thetas):
             try:
-                vals = f(data_arrays, thetas)  # entire array at once
+                vals = f(data_arrays, thetas)
                 if not np.all(np.isfinite(vals)):
                     return np.full(len(y_measured), 1e10)
                 return vals
@@ -113,7 +121,6 @@ def fitness(individual, data_arrays, y_measured, gp_config, n_start=0):
 
         predicted = model(dummy_X, *popt)
         MSE = np.mean((predicted - y_measured) ** 2)
-        n_nodes = len(individual)  # total node count, not just params
         BIC = n_data * np.log(MSE + 1e-30) + n_params * np.log(n_data) * 3
         return (BIC,)
 
@@ -122,10 +129,7 @@ def fitness(individual, data_arrays, y_measured, gp_config, n_start=0):
 
 
 # ─────────────────────────────────────────────
-# SECTION 3: DEAP SETUP — extended primitive set
-# Target: exp(-theta^2 / (2*sigma^2)) / sqrt(2*pi*sigma^2)
-# Needed primitives: exp, sq (x^2), div, mul, add, sub
-# Terminals: theta, sigma, theta^2, sigma^2
+# SECTION 3: DEAP SETUP (unchanged)
 # ─────────────────────────────────────────────
 
 pset = gp.PrimitiveSet("f", arity=0)
@@ -136,7 +140,6 @@ pset.addPrimitive(safe_div,      2, name="/")
 pset.addPrimitive(safe_exp,      1, name="exp")
 pset.addPrimitive(safe_sq,       1, name="sq")
 
-# Terminals: raw variables and useful precomputed combos
 pset.addTerminal("theta",   name="theta")
 pset.addTerminal("sigma",   name="sigma")
 pset.addTerminal("theta^2", name="theta^2")
@@ -157,8 +160,9 @@ toolbox.decorate("mutate", gp.staticLimit(key=operator.attrgetter("height"), max
 toolbox.decorate("mate",   gp.staticLimit(key=len, max_value=20))
 toolbox.decorate("mutate", gp.staticLimit(key=len, max_value=20))
 
+
 # ─────────────────────────────────────────────
-# SECTION 4: WIRE DATA AND FITNESS
+# SECTION 4: DATA AND FITNESS (unchanged)
 # ─────────────────────────────────────────────
 
 bin_prim_funcs   = {"+": operator.add, "-": operator.sub, "*": operator.mul, "/": safe_div}
@@ -172,40 +176,24 @@ gp_config = {
 }
 
 def load_feynman_dataset(filepath, n_samples=None, noise_frac=0.0, seed=0):
-    """
-    Load a Feynman dataset file.
-    Format: space/tab delimited, columns = [var1, var2, ..., y]
-    For I.6.2a: columns are [theta, sigma, y]
-
-    n_samples   : if set, randomly subsample this many rows (dataset has 10^6 rows)
-    noise_frac  : add Gaussian noise as fraction of y std (0.0 = use clean data as-is)
-    """
-    raw = np.loadtxt(filepath)  # shape (N, D+1)
-    
+    raw = np.loadtxt(filepath)
     if n_samples is not None and n_samples < len(raw):
         rng = np.random.default_rng(seed)
         idx = rng.choice(len(raw), size=n_samples, replace=False)
         raw = raw[idx]
-    
-    X = raw[:, :-1]   # all columns except last → input variables
-    y = raw[:, -1]    # last column → target
-    
+    X = raw[:, :-1]
+    y = raw[:, -1]
     if noise_frac > 0.0:
         rng = np.random.default_rng(seed)
         y = y + rng.normal(scale=noise_frac * np.std(y), size=len(y))
-    
     return X, y
 
-
-# ── Load the actual Feynman file ──
-# Variables for I.6.2a: col 0 = theta, col 1 = sigma, col 2 = y
 X, y = load_feynman_dataset(
     filepath="feynman_with_units/I.6.2",
     n_samples=500,
     noise_frac=0.01,
     seed=0
 )
-
 
 theta_vals = X[:, 0]
 sigma_vals = X[:, 1]
@@ -223,13 +211,145 @@ def evaluate_individual(ind):
 
 toolbox.register("evaluate", evaluate_individual)
 
+
 # ─────────────────────────────────────────────
-# SECTION 5: MAIN GP LOOP (unchanged structure)
+# SECTION 5: SEMANTIC SIMILARITY-BASED CROSSOVER (SSC)
+#
+# From: Nguyen Quang Uy et al., "Semantically-based Crossover in GP"
+#
+# THE BUG THAT WAS FIXED:
+#   Previous code did:  ind1[:] = ind1[:idx1] + ind2[slice2] + ind1[slice1.stop:]
+#   When slice1.stop == len(ind1), Python creates slice(stop, None) for the suffix,
+#   and DEAP's PrimitiveTree.__setitem__ does:  if key.start >= len(self)
+#   which crashes with TypeError when key.start is None.
+#
+# THE FIX:
+#   Use explicit integer indices (start, stop) extracted from the slice object,
+#   build new node lists as plain Python lists, then assign all at once.
+#   We never pass a slice object to __setitem__ — only a complete list.
 # ─────────────────────────────────────────────
 
-def run_gp(n_pop=200, n_gen=30, n_hof=10, cx_prob=0.6, mut_prob=0.2, seed=42):
+SSC_ALPHA     = 1e-4   # lower SSD bound: subtrees must differ by at least this
+SSC_BETA      = 0.4    # upper SSD bound: subtrees must not differ by more than this
+SSC_MAX_TRIAL = 12     # attempts before falling back to standard crossover
+SSC_N_POINTS  = 20     # random sample points for semantic evaluation
+
+_SSC_THETA_RANGE = (-3.0, 3.0)
+_SSC_SIGMA_RANGE = (0.5,  3.0)
+
+
+def _sample_subtree_semantics(node_names, n_points=SSC_N_POINTS):
+    rng = np.random.default_rng()
+    theta_s = rng.uniform(*_SSC_THETA_RANGE, size=n_points)
+    sigma_s = rng.uniform(*_SSC_SIGMA_RANGE, size=n_points)
+
+    sample_arrays = {
+        "theta":   theta_s,
+        "sigma":   sigma_s,
+        "theta^2": theta_s**2,
+        "sigma^2": sigma_s**2,
+    }
+    try:
+        f, n_params = param_incl(
+            list(node_names),       # param_incl mutates its input — must pass a copy
+            unary_prim_funcs,
+            bin_prim_funcs,
+            arg_set,
+            n_start=0
+        )
+        thetas = np.ones(n_params + 1)
+        vals = f(sample_arrays, thetas)
+        if not np.all(np.isfinite(vals)):
+            return None
+        return vals
+    except Exception:
+        return None
+
+
+def _ssd(sem1, sem2):
+    """Mean absolute difference"""
+    return float(np.mean(np.abs(sem1 - sem2)))
+
+
+def semantic_similarity_crossover(ind1, ind2,
+                                   alpha=SSC_ALPHA,
+                                   beta=SSC_BETA,
+                                   max_trials=SSC_MAX_TRIAL,
+                                   n_points=SSC_N_POINTS):
+    if len(ind1) < 2 or len(ind2) < 2:
+        return gp.cxOnePoint(ind1, ind2)
+
+    for _ in range(max_trials):
+        # Random crossover points
+        idx1 = random.randint(1, len(ind1) - 1)
+        idx2 = random.randint(1, len(ind2) - 1)
+
+        # Get subtree boundaries as plain integers
+        sl1 = ind1.searchSubtree(idx1)
+        sl2 = ind2.searchSubtree(idx2)
+        s1, e1 = sl1.start, sl1.stop 
+        s2, e2 = sl2.start, sl2.stop 
+
+        # Evaluate semantics of each subtree
+        names1 = [node.name for node in list(ind1)[s1:e1]]
+        names2 = [node.name for node in list(ind2)[s2:e2]]
+
+        sem1 = _sample_subtree_semantics(names1, n_points)
+        sem2 = _sample_subtree_semantics(names2, n_points)
+
+        if sem1 is None or sem2 is None:
+            continue
+
+        dist = _ssd(sem1, sem2)
+
+        if alpha < dist < beta:
+            nodes1 = list(ind1)
+            nodes2 = list(ind2)
+
+            sub1 = nodes1[s1:e1] 
+            sub2 = nodes2[s2:e2]   
+            
+            new_nodes1 = nodes1[:s1] + sub2 + nodes1[e1:]
+            new_nodes2 = nodes2[:s2] + sub1 + nodes2[e2:]
+
+            if not new_nodes1 or not new_nodes2:
+                continue
+
+            # Assign back — safe because we pass a complete plain list
+            ind1[0:len(ind1)] = new_nodes1
+            ind2[0:len(ind2)] = new_nodes2
+
+            del ind1.fitness.values
+            del ind2.fitness.values
+            return ind1, ind2
+
+    # Fallback after max_trials failures
+    return gp.cxOnePoint(ind1, ind2)
+
+
+# ─────────────────────────────────────────────
+# SECTION 6: GP LOOP
+# ─────────────────────────────────────────────
+
+def run_gp(n_pop=200, n_gen=30, n_hof=10, cx_prob=0.6, mut_prob=0.2,
+           seed=42, use_ssc=False):
     random.seed(seed)
     np.random.seed(seed)
+
+    logger     = logger_ssc if use_ssc else logger_sc
+    mode_label = "SSC" if use_ssc else "Standard"
+
+    # Re-register mate and reapply decorators
+    if use_ssc:
+        toolbox.register("mate", semantic_similarity_crossover)
+    else:
+        toolbox.register("mate", gp.cxOnePoint)
+    toolbox.decorate("mate", gp.staticLimit(key=operator.attrgetter("height"), max_value=6))
+    toolbox.decorate("mate", gp.staticLimit(key=len, max_value=20))
+
+    toolbox.register("mutate", gp.mutUniform, expr=toolbox.expr, pset=pset)
+    toolbox.decorate("mutate", gp.staticLimit(key=operator.attrgetter("height"), max_value=6))
+    toolbox.decorate("mutate", gp.staticLimit(key=len, max_value=20))
 
     pop = toolbox.population(n=n_pop)
     hof = tools.HallOfFame(n_hof)
@@ -250,9 +370,9 @@ def run_gp(n_pop=200, n_gen=30, n_hof=10, cx_prob=0.6, mut_prob=0.2, seed=42):
         history_avg.append(np.mean(valid_fits))
         history_worst.append(max(valid_fits))
         history_diversity.append(len(set(str(ind) for ind in pop)) / n_pop)
-        logging.info("Gen   0 | initial population evaluated")
+        logger.info(f"[{mode_label}] Gen 0 | initial population evaluated")
 
-        for gen in tqdm(range(n_gen), desc="Evolving"):
+        for gen in tqdm(range(n_gen), desc=f"Evolving ({mode_label})"):
             offspring = algorithms.varAnd(pop, toolbox, cxpb=cx_prob, mutpb=mut_prob)
             n_immigrants = n_pop // 5
             immigrants   = toolbox.population(n=n_immigrants)
@@ -274,7 +394,7 @@ def run_gp(n_pop=200, n_gen=30, n_hof=10, cx_prob=0.6, mut_prob=0.2, seed=42):
             history_diversity.append(len(set(str(ind) for ind in pop)) / n_pop)
 
             best = min(ind.fitness.values[0] for ind in pop)
-            logging.info(f"Gen {gen+1:3d} | best BIC: {best:.3f}")
+            logger.info(f"[{mode_label}] Gen {gen+1:3d} | best BIC: {best:.3f}")
 
     return hof, {
         "best":      history_best,
@@ -285,79 +405,119 @@ def run_gp(n_pop=200, n_gen=30, n_hof=10, cx_prob=0.6, mut_prob=0.2, seed=42):
 
 
 # ─────────────────────────────────────────────
-# SECTION 6: RUN AND RESULTS
+# SECTION 7: RESULTS AND COMPARISON PLOT
 # ─────────────────────────────────────────────
 
-if __name__ == "__main__":
-    logging.info("Running GP on Feynman I.6.2a ...")
-    hof, stats = run_gp(n_pop=500, n_gen=50, n_hof=10, cx_prob = 0.5, mut_prob=0.4)
-
-    print("\n── Hall of Fame ──")
+def print_hof(hof, label):
+    print(f"\n── Hall of Fame [{label}] ──")
     for i, ind in enumerate(hof):
         print(f"{i+1:2d}. BIC={ind.fitness.values[0]:.3f}  expr={str(ind)}")
 
-    # ── Fit and display parameters for all HoF individuals ──
-    print("\n── Hall of Fame Parameter Fits ──")
-    print(f"Ground truth: theta[0]=1/sqrt(2π)≈{1/np.sqrt(2*np.pi):.6f}, theta_inner=-0.5\n")
+    print(f"\n── Parameter Fits [{label}] ──")
+    print(f"Ground truth: 1/sqrt(2π) ≈ {1/np.sqrt(2*np.pi):.6f}\n")
 
     for rank, ind in enumerate(hof):
         try:
             f, n_params = param_incl(
                 [node.name for node in ind],
-                unary_prim_funcs,
-                bin_prim_funcs,
-                arg_set,
-                n_start=0
+                unary_prim_funcs, bin_prim_funcs, arg_set, n_start=0
             )
-
             def make_model(f):
                 def model(dummy_X, *thetas):
                     vals = f(data_arrays, thetas)
                     return vals if np.all(np.isfinite(vals)) else np.full(len(y_measured_global), 1e10)
                 return model
-
-            model = make_model(f)
+            model   = make_model(f)
             dummy_X = np.zeros(len(y_measured_global))
-            p0 = [1.0] * n_params
-
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                popt, pcov = curve_fit(model, dummy_X, y_measured_global, p0=p0, maxfev=5000)
-
+                popt, _ = curve_fit(model, dummy_X, y_measured_global,
+                                    p0=[1.0]*n_params, maxfev=5000)
             predicted = model(dummy_X, *popt)
-            R2 = 1 - np.sum((y_measured_global - predicted)**2) / np.sum((y_measured_global - np.mean(y_measured_global))**2)
+            R2 = 1 - np.sum((y_measured_global - predicted)**2) / \
+                     np.sum((y_measured_global - np.mean(y_measured_global))**2)
             params_str = ", ".join(f"θ[{i}]={v:.6f}" for i, v in enumerate(popt))
-
             print(f"{rank+1:2d}. {str(ind)}")
             print(f"    params : {params_str}")
             print(f"    R²     : {R2:.8f}  n_params={n_params}\n")
-
         except Exception as e:
             print(f"{rank+1:2d}. {str(ind)}")
             print(f"    FAILED : {e}\n")
-    
+
+
+if __name__ == "__main__":
     import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
 
-    gens = range(len(stats["best"]))
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    GP_PARAMS = dict(n_pop=500, n_gen=50, n_hof=10, cx_prob=0.5, mut_prob=0.4)
+    print("\n" + "=" * 60)
+    print("Running GP with SEMANTIC SIMILARITY-BASED CROSSOVER (SSC) ...")
+    print("=" * 60)
+    hof_ssc, stats_ssc = run_gp(**GP_PARAMS, seed=42, use_ssc=True)
 
-    ax1.plot(gens, stats["best"],  label="Best BIC",    color="green",  linewidth=2)
-    ax1.plot(gens, stats["avg"],   label="Average BIC", color="blue",   linewidth=1.5, linestyle="--")
-    ax1.plot(gens, stats["worst"], label="Worst BIC",   color="red",    linewidth=1,   linestyle=":")
-    ax1.set_ylabel("BIC (lower = better)")
-    ax1.set_title("GP Convergence — Feynman I.6.2")
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+    print("=" * 60)
+    print("Running GP with STANDARD CROSSOVER ...")
+    print("=" * 60)
+    hof_sc, stats_sc = run_gp(**GP_PARAMS, seed=42, use_ssc=False)
 
-    ax2.plot(gens, stats["diversity"], color="purple", linewidth=2)
-    ax2.set_ylabel("Diversity (unique exprs / pop size)")
-    ax2.set_xlabel("Generation")
-    ax2.set_ylim(0, 1)
-    ax2.axhline(y=0.2, color="red", linestyle="--", alpha=0.5, label="Low diversity warning")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
 
+    print_hof(hof_sc,  "Standard Crossover")
+    print_hof(hof_ssc, "SSC")
+
+    best_sc  = hof_sc[0].fitness.values[0]
+    best_ssc = hof_ssc[0].fitness.values[0]
+    print("\n" + "=" * 60)
+    print("COMPARISON SUMMARY")
+    print("=" * 60)
+    print(f"  Standard — Best BIC : {best_sc:.4f}")
+    print(f"  SSC      — Best BIC : {best_ssc:.4f}")
+    print(f"  Winner (lower is better) : {'SSC' if best_ssc < best_sc else 'Standard'}")
+    print(f"  Final diversity — SC : {stats_sc['diversity'][-1]:.3f}")
+    print(f"  Final diversity — SSC: {stats_ssc['diversity'][-1]:.3f}")
+
+    gens = range(len(stats_sc["best"]))
+    fig  = plt.figure(figsize=(14, 10))
+    gs   = gridspec.GridSpec(2, 2, figure=fig)
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.plot(gens, stats_sc["best"],  label="SC  — Best BIC",  color="blue",   linewidth=2)
+    ax1.plot(gens, stats_ssc["best"], label="SSC — Best BIC",  color="orange", linewidth=2, linestyle="--")
+    ax1.set_ylabel("Best BIC (lower = better)")
+    ax1.set_title("Best BIC: Standard vs SSC")
+    ax1.legend(); ax1.grid(True, alpha=0.3)
+
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.plot(gens, stats_sc["avg"],  label="SC  — Avg BIC",  color="blue",   linewidth=2)
+    ax2.plot(gens, stats_ssc["avg"], label="SSC — Avg BIC",  color="orange", linewidth=2, linestyle="--")
+    ax2.set_ylabel("Average BIC")
+    ax2.set_title("Average BIC: Standard vs SSC")
+    ax2.legend(); ax2.grid(True, alpha=0.3)
+
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.plot(gens, stats_sc["diversity"],  label="SC  — Diversity", color="blue",   linewidth=2)
+    ax3.plot(gens, stats_ssc["diversity"], label="SSC — Diversity", color="orange", linewidth=2, linestyle="--")
+    ax3.axhline(y=0.2, color="red", linestyle=":", alpha=0.5, label="Low diversity threshold")
+    ax3.set_ylabel("Diversity (unique exprs / pop)")
+    ax3.set_xlabel("Generation")
+    ax3.set_ylim(0, 1)
+    ax3.set_title("Population Diversity: Standard vs SSC")
+    ax3.legend(); ax3.grid(True, alpha=0.3)
+
+    ax4 = fig.add_subplot(gs[1, 1])
+    ax4.plot(gens, stats_ssc["best"],  label="SSC Best",  color="green",  linewidth=2)
+    ax4.plot(gens, stats_ssc["avg"],   label="SSC Avg",   color="blue",   linewidth=1.5, linestyle="--")
+    ax4.plot(gens, stats_ssc["worst"], label="SSC Worst", color="red",    linewidth=1,   linestyle=":")
+    ax4.set_ylabel("BIC")
+    ax4.set_xlabel("Generation")
+    ax4.set_title("SSC Convergence Detail")
+    ax4.legend(); ax4.grid(True, alpha=0.3)
+
+    plt.suptitle(
+        "GP Symbolic Regression — Feynman I.6.2\n"
+        "Standard Crossover vs Semantic Similarity-based Crossover (SSC)",
+        fontsize=13, fontweight="bold"
+    )
     plt.tight_layout()
-    plt.savefig("gp_convergence.png", dpi=150)
+    plt.savefig("gp_comparison_sc_vs_ssc.png", dpi=150)
     plt.show()
-    print("Convergence plot saved to gp_convergence.png")
+    print("\nPlot saved to gp_comparison_sc_vs_ssc.png")
